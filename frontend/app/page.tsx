@@ -244,9 +244,9 @@ export default function VideoProcessingUI() {
           </p>
         </div>
 
-        <div className="grid lg:grid-cols-2 gap-8">
+        <div className="grid lg:grid-cols-2 gap-8 lg:items-start">
           {/* Producer Section */}
-          <Card className="h-fit bg-gray-800 border-gray-700">
+          <Card className="bg-gray-800 border-gray-700 h-full">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-white">
                 <Play className="w-5 h-5" />
@@ -261,84 +261,85 @@ export default function VideoProcessingUI() {
                 {demoVideos.map((video) => (
                   <div
                     key={video.id}
-                    className={`border rounded-lg p-4 transition-all hover:shadow-lg ${
+                    className={`border rounded-lg p-5 transition-all hover:shadow-lg ${
                       activeStream === video.id
                         ? "border-custom-red bg-custom-red/10"
                         : "border-gray-600 bg-gray-700/50 hover:bg-gray-700"
                     }`}
                   >
-                    <div className="flex gap-4">
-                      <div className="relative flex-shrink-0">
+                    <div className="flex gap-5 items-center">
+                      <div className="relative flex-shrink-0 w-[140px] h-[140px]">
                         <Image
                           src={video.thumbnail || "/placeholder.svg"}
                           alt={video.title}
-                          width={120}
-                          height={80}
-                          className="rounded-md object-cover"
+                          fill
+                          className="rounded-lg object-cover"
                         />
                         {activeStream === video.id && (
-                          <div className="absolute inset-0 bg-black/20 rounded-md flex items-center justify-center">
-                            <Radio className="w-6 h-6 text-white animate-pulse" />
+                          <div className="absolute inset-0 bg-black/20 rounded-lg flex items-center justify-center">
+                            <Radio className="w-8 h-8 text-white animate-pulse" />
                           </div>
                         )}
                       </div>
 
-                      <div className="flex-1 min-w-0 flex flex-col justify-between">
-                        <div>
-                          <div className="flex items-start justify-between mb-2">
-                            <h3 className="font-semibold text-white truncate">
-                              {video.title}
-                            </h3>
-                            {activeStream === video.id && (
-                              <Badge
-                                variant="secondary"
-                                className="ml-2 bg-green-900/50 text-green-300 border-green-700"
+                      <div className="flex-1 min-w-0 flex flex-col justify-center h-[140px]">
+                        <div className="flex-1 flex flex-col justify-between">
+                          <div>
+                            <div className="flex items-start justify-between mb-3">
+                              <h3 className="text-xl font-semibold text-white truncate pr-2">
+                                {video.title}
+                              </h3>
+                              {activeStream === video.id && (
+                                <Badge
+                                  variant="secondary"
+                                  className="ml-2 bg-green-900/50 text-green-300 border-green-700 flex-shrink-0"
+                                >
+                                  <Radio className="w-3 h-3 mr-1" />
+                                  Streaming
+                                </Badge>
+                              )}
+                            </div>
+                            <p className="text-sm text-gray-300 mb-2 leading-relaxed">
+                              {video.description}
+                            </p>
+                            <p className="text-xs text-gray-400 mb-4">
+                              {video.filename}
+                            </p>
+                          </div>
+
+                          <div className="flex gap-2">
+                            {activeStream === video.id ? (
+                              <Button
+                                onClick={handleStopStream}
+                                variant="outline"
+                                size="default"
+                                className="text-custom-red border-custom-red hover:bg-custom-red hover:text-white bg-transparent"
                               >
-                                <Radio className="w-3 h-3 mr-1" />
-                                Streaming
-                              </Badge>
+                                Stop Stream
+                              </Button>
+                            ) : (
+                              <Button
+                                onClick={() => handleStartStream(video)}
+                                disabled={
+                                  loadingVideoId === video.id || !!activeStream
+                                }
+                                size="default"
+                                className="bg-custom-red hover:bg-custom-red/90 border-custom-red text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                              >
+                                {loadingVideoId === video.id ? (
+                                  <>
+                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                    Starting...
+                                  </>
+                                ) : (
+                                  <>
+                                    <Play className="w-4 h-4 mr-2" />
+                                    Start Live Stream
+                                  </>
+                                )}
+                              </Button>
                             )}
                           </div>
-                          <p className="text-sm text-gray-300 mb-3">
-                            {video.description}
-                          </p>
-                          <p className="text-xs text-gray-400 mb-3">
-                            {video.filename}
-                          </p>
-                        </div>
-
-                        <div className="flex gap-2 items-end">
-                          {activeStream === video.id ? (
-                            <Button
-                              onClick={handleStopStream}
-                              variant="outline"
-                              size="sm"
-                              className="text-custom-red border-custom-red hover:bg-custom-red hover:text-white bg-transparent"
-                            >
-                              Stop Stream
-                            </Button>
-                          ) : (
-                            <Button
-                              onClick={() => handleStartStream(video)}
-                              disabled={
-                                loadingVideoId === video.id || !!activeStream
-                              }
-                              size="sm"
-                              className="bg-custom-red hover:bg-custom-red/90 border-custom-red text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                              {loadingVideoId === video.id ? (
-                                <>
-                                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                  Starting...
-                                </>
-                              ) : (
-                                <>
-                                  <Play className="w-4 h-4 mr-2" />
-                                  Start Live Stream
-                                </>
-                              )}
-                            </Button>
-                          )}
                         </div>
                       </div>
                     </div>
@@ -349,11 +350,11 @@ export default function VideoProcessingUI() {
           </Card>
 
           {/* Consumer Section */}
-          <Card className="h-fit bg-gray-800 border-gray-700">
+          <Card className="bg-gray-800 border-gray-700 h-full">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-white">
                 <Radio className="w-5 h-5" />
-                Streamh
+                Stream
               </CardTitle>
               <CardDescription className="text-gray-300">
                 Watch the processed video in real time.
