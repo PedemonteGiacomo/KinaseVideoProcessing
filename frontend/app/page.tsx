@@ -135,6 +135,7 @@ export default function VideoProcessingUI() {
   const [lastProcessedFrame, setLastProcessedFrame] = useState<string | null>(
     null
   ); // s3_url
+  const [lastDetections, setLastDetections] = useState<number>(0);
 
   const activeVideo = demoVideos.find((v) => v.id === activeStream);
 
@@ -144,24 +145,22 @@ export default function VideoProcessingUI() {
     async function pollSQS() {
       const results = await receiveLiveVideo();
       if (Array.isArray(results)) {
-        for (const result of results) {
-          if (result && result.detections) {
-            // Log each detection
-            result.detections.forEach((d: any) => {
-              addLog(
-                `Rilevato: ${d.class} (confidence: ${(
-                  d.confidence * 100
-                ).toFixed(1)}%) [${d.x}, ${d.y}, ${d.width}x${d.height}]`,
-                "detection"
-              );
-            });
-            // Aggiorna il frame processato
-            if (result.s3_url) {
-              setLastProcessedFrame(result.s3_url);
-              addLog(`Frame processato: ${result.s3_url}`, "info");
-            }
-          }
-        }
+        results.forEach((r) => {
+          // 3.1 URL S3
+          const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
+          setLastProcessedFrame(url);
+
+          // 3.2 numero oggetti
+          setLastDetections(r.detections_count);
+
+          // 3.3 log sintetico
+          addLog(`Frame #${r.frame_index} → ${r.detections_count} objects`, "info");
+
+          // 3.4 log dettaglio per oggetto
+          r.summary?.forEach((d: any) =>
+            addLog(`${d.class} ${(d.conf * 100).toFixed(0)}%`, "detection")
+          );
+        });
       } else if (results) {
         const errMsg =
           typeof results === "object" && results && "message" in results
@@ -204,47 +203,43 @@ export default function VideoProcessingUI() {
   let frameInterval: NodeJS.Timeout | null = null;
   let frameCount = 0;
 
-  // Helper: capture frame from video element and send to Kinesis
+  // Helper: cattura un frame dal <video> e lo invia a Kinesis come bytes JPEG
   const captureAndSendFrame = async (video: HTMLVideoElement) => {
-    if (video.readyState < 2) return;
+    if (video.readyState < 2) return;           // il video non è ancora pronto
+
+    // — opzionale: ridimensiona per stare sotto 1 MB —
+    const MAX_W = 640;
+    const scale = MAX_W / video.videoWidth;
+    const w = Math.min(MAX_W, video.videoWidth);
+    const h = video.videoHeight * scale;
+
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.drawImage(video, 0, 0);
-    return new Promise<void>((resolve) => {
-      canvas.toBlob(
-        async (blob) => {
-          if (!blob) return resolve();
-          const arrayBuffer = await blob.arrayBuffer();
-          const base64 = btoa(
-            String.fromCharCode(...new Uint8Array(arrayBuffer))
-          );
-          const payload = {
-            timestamp: new Date().toISOString(),
-            frame_id: `frame_${Date.now()}_${frameCount++}`,
-            frame_data: base64,
-            format: "jpeg",
-            source: "frontend-demo-video",
-          };
-          const result = await sendVideoFrame(JSON.stringify(payload));
-          if (result === true) {
-            addLog("Frame inviato a Kinesis", "info");
-          } else {
-            const errMsg =
-              typeof result === "object" && result && "message" in result
-                ? (result as any).message
-                : String(result);
-            addLog("Errore invio frame: " + errMsg, "error");
-          }
-          resolve();
-        },
-        "image/jpeg",
-        0.8
-      );
-    });
+    ctx.drawImage(video, 0, 0, w, h);
+
+    canvas.toBlob(
+      async (blob) => {
+        if (!blob) return;
+        const arrayBuffer = await blob.arrayBuffer();
+        const frameBytes = new Uint8Array(arrayBuffer);   // <-- bytes grezzi
+
+        const res = await sendVideoFrame(frameBytes);
+        if (res !== true) {
+          const errMsg =
+            typeof res === "object" && res && "message" in res
+              ? (res as any).message
+              : String(res);
+          addLog("Errore invio frame: " + errMsg, "error");
+        }
+      },
+      "image/jpeg",
+      0.8        // qualità/compressione JPEG (0-1)
+    );
   };
+
 
   // Start streaming: play video, extract frames, send to Kinesis
   const handleStartStream = async (video: DemoVideo) => {
@@ -319,11 +314,10 @@ export default function VideoProcessingUI() {
                 {demoVideos.map((video) => (
                   <div
                     key={video.id}
-                    className={`border rounded-lg p-5 transition-all hover:shadow-lg ${
-                      activeStream === video.id
+                    className={`border rounded-lg p-5 transition-all hover:shadow-lg ${activeStream === video.id
                         ? "border-custom-red bg-custom-red/10"
                         : "border-gray-600 bg-gray-700/50 hover:bg-gray-700"
-                    }`}
+                      }`}
                   >
                     <div className="flex gap-5 items-center">
                       <div className="relative flex-shrink-0 w-[140px] h-[140px]">
@@ -417,13 +411,18 @@ export default function VideoProcessingUI() {
                 {streamStarted && activeVideo ? (
                   <div className="w-full h-full flex flex-col relative">
                     {/* Mostra il frame processato da AWS (s3_url) */}
-                    {lastProcessedFrame ? (
-                      <img
-                        src={lastProcessedFrame}
-                        alt="Processed frame"
-                        className="w-full h-full object-contain bg-black rounded-lg"
-                        style={{ maxHeight: "100%", maxWidth: "100%" }}
-                      />
+                    {streamStarted && lastProcessedFrame ? (
+                      <>
+                        <img
+                          src={lastProcessedFrame}
+                          alt="Processed frame"
+                          className="w-full h-full object-contain bg-black"
+                        />
+                        {/* ✓ contatore oggetti */}
+                        <div className="absolute bottom-4 left-4 bg-black/70 text-xs text-white px-2 py-1 rounded">
+                          {lastDetections} objects
+                        </div>
+                      </>
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-gray-500 bg-black rounded-lg">
                         <span>Nessun frame processato ancora</span>
@@ -486,11 +485,10 @@ export default function VideoProcessingUI() {
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-2">
                     <div
-                      className={`w-2 h-2 rounded-full ${
-                        wsConnected
+                      className={`w-2 h-2 rounded-full ${wsConnected
                           ? "bg-green-500 animate-pulse"
                           : "bg-gray-500"
-                      }`}
+                        }`}
                     ></div>
                     <h3 className="text-lg font-semibold text-white">
                       Processing Logs
@@ -530,13 +528,12 @@ export default function VideoProcessingUI() {
                             [{log.timestamp}]
                           </span>
                           <span
-                            className={`flex-1 ${
-                              log.type === "detection"
+                            className={`flex-1 ${log.type === "detection"
                                 ? "text-green-400"
                                 : log.type === "error"
-                                ? "text-red-400"
-                                : "text-gray-300"
-                            }`}
+                                  ? "text-red-400"
+                                  : "text-gray-300"
+                              }`}
                           >
                             {log.message}
                           </span>
@@ -550,9 +547,8 @@ export default function VideoProcessingUI() {
                   <div className="mt-4 flex items-center justify-between text-xs">
                     <div className="flex items-center gap-2 text-gray-400">
                       <div
-                        className={`w-1.5 h-1.5 rounded-full ${
-                          wsConnected ? "bg-green-500" : "bg-red-500"
-                        }`}
+                        className={`w-1.5 h-1.5 rounded-full ${wsConnected ? "bg-green-500" : "bg-red-500"
+                          }`}
                       ></div>
                       WebSocket: {wsConnected ? "Connected" : "Disconnected"}
                     </div>
