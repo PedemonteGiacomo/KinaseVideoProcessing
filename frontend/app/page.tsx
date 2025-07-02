@@ -132,75 +132,60 @@ export default function VideoProcessingUI() {
     }>
   >([]);
   const [wsConnected, setWsConnected] = useState(false);
+  const [lastProcessedFrame, setLastProcessedFrame] = useState<string | null>(
+    null
+  ); // s3_url
 
   const activeVideo = demoVideos.find((v) => v.id === activeStream);
 
   useEffect(() => {
-    let detectionInterval: NodeJS.Timeout | null = null;
+    let pollingInterval: NodeJS.Timeout | null = null;
+
+    async function pollSQS() {
+      const results = await receiveLiveVideo();
+      if (Array.isArray(results)) {
+        for (const result of results) {
+          if (result && result.detections) {
+            // Log each detection
+            result.detections.forEach((d: any) => {
+              addLog(
+                `Rilevato: ${d.class} (confidence: ${(
+                  d.confidence * 100
+                ).toFixed(1)}%) [${d.x}, ${d.y}, ${d.width}x${d.height}]`,
+                "detection"
+              );
+            });
+            // Aggiorna il frame processato
+            if (result.s3_url) {
+              setLastProcessedFrame(result.s3_url);
+              addLog(`Frame processato: ${result.s3_url}`, "info");
+            }
+          }
+        }
+      } else if (results) {
+        const errMsg =
+          typeof results === "object" && results && "message" in results
+            ? (results as any).message
+            : String(results);
+        addLog("Errore ricezione risultati: " + errMsg, "error");
+      }
+    }
 
     if (streamStarted && activeVideo) {
-      // Simulate successful WebSocket connection
       setWsConnected(true);
-      addLog("WebSocket connected successfully", "info");
+      addLog("WebSocket connected (simulato)", "info");
       addLog(`Starting object detection for ${activeVideo.filename}`, "info");
-
-      // Simulate receiving object detection data
-      const simulateDetection = () => {
-        const objects = [
-          "person",
-          "car",
-          "bicycle",
-          "dog",
-          "cat",
-          "bird",
-          "traffic light",
-          "stop sign",
-        ];
-        const confidences = [0.85, 0.92, 0.78, 0.95, 0.88, 0.73, 0.91, 0.82];
-
-        const randomObject =
-          objects[Math.floor(Math.random() * objects.length)];
-        const randomConfidence =
-          confidences[Math.floor(Math.random() * confidences.length)];
-        const x = Math.floor(Math.random() * 1920);
-        const y = Math.floor(Math.random() * 1080);
-        const width = Math.floor(Math.random() * 200) + 50;
-        const height = Math.floor(Math.random() * 200) + 50;
-
-        addLog(
-          `Detected: ${randomObject} (${(randomConfidence * 100).toFixed(
-            1
-          )}%) at [${x}, ${y}, ${width}x${height}]`,
-          "detection"
-        );
-      };
-
-      // Start detection simulation after a short delay
-      const startDelay = setTimeout(() => {
-        detectionInterval = setInterval(
-          simulateDetection,
-          2000 + Math.random() * 3000
-        );
-      }, 1000);
-
-      return () => {
-        clearTimeout(startDelay);
-        if (detectionInterval) {
-          clearInterval(detectionInterval);
-        }
-      };
+      pollingInterval = setInterval(pollSQS, 1500);
     } else {
-      // When stream stops, simulate WebSocket disconnection
       if (wsConnected) {
         setWsConnected(false);
         addLog("WebSocket disconnected", "info");
       }
+      setLastProcessedFrame(null);
     }
 
     return () => {
-      if (detectionInterval) {
-        clearInterval(detectionInterval);
-      }
+      if (pollingInterval) clearInterval(pollingInterval);
     };
   }, [streamStarted, activeVideo]);
 
@@ -214,14 +199,80 @@ export default function VideoProcessingUI() {
     setLogs((prev) => [...prev.slice(-49), newLog]); // Keep last 50 logs
   };
 
+  // --- Video frame extraction and Kinesis integration ---
+  let videoElement: HTMLVideoElement | null = null;
+  let frameInterval: NodeJS.Timeout | null = null;
+  let frameCount = 0;
+
+  // Helper: capture frame from video element and send to Kinesis
+  const captureAndSendFrame = async (video: HTMLVideoElement) => {
+    if (video.readyState < 2) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0);
+    return new Promise<void>((resolve) => {
+      canvas.toBlob(
+        async (blob) => {
+          if (!blob) return resolve();
+          const arrayBuffer = await blob.arrayBuffer();
+          const base64 = btoa(
+            String.fromCharCode(...new Uint8Array(arrayBuffer))
+          );
+          const payload = {
+            timestamp: new Date().toISOString(),
+            frame_id: `frame_${Date.now()}_${frameCount++}`,
+            frame_data: base64,
+            format: "jpeg",
+            source: "frontend-demo-video",
+          };
+          const result = await sendVideoFrame(JSON.stringify(payload));
+          if (result === true) {
+            addLog("Frame inviato a Kinesis", "info");
+          } else {
+            const errMsg =
+              typeof result === "object" && result && "message" in result
+                ? (result as any).message
+                : String(result);
+            addLog("Errore invio frame: " + errMsg, "error");
+          }
+          resolve();
+        },
+        "image/jpeg",
+        0.8
+      );
+    });
+  };
+
+  // Start streaming: play video, extract frames, send to Kinesis
   const handleStartStream = async (video: DemoVideo) => {
     setLoadingVideoId(video.id);
-
-    // Simulate loading delay first
     setTimeout(() => {
       setActiveStream(video.id);
       setStreamStarted(true);
       setLoadingVideoId(null);
+      setTimeout(() => {
+        // Create hidden video element for frame extraction
+        if (!videoElement) {
+          videoElement = document.createElement("video");
+          videoElement.src = `/videos/${video.filename}`;
+          videoElement.crossOrigin = "anonymous";
+          videoElement.muted = true;
+          videoElement.playsInline = true;
+          videoElement.style.display = "none";
+          document.body.appendChild(videoElement);
+        }
+        videoElement.currentTime = 0;
+        videoElement.play();
+        // Start frame extraction loop (10 FPS)
+        frameInterval = setInterval(() => {
+          if (videoElement && !videoElement.paused && !videoElement.ended) {
+            captureAndSendFrame(videoElement);
+          }
+        }, 100);
+      }, 500);
     }, 1500);
   };
 
@@ -230,6 +281,13 @@ export default function VideoProcessingUI() {
     setStreamStarted(false);
     setLogs([]);
     setWsConnected(false);
+    // Stop frame extraction
+    if (frameInterval) clearInterval(frameInterval);
+    if (videoElement) {
+      videoElement.pause();
+      videoElement.remove();
+      videoElement = null;
+    }
   };
 
   return (
@@ -282,64 +340,58 @@ export default function VideoProcessingUI() {
                         )}
                       </div>
 
-                      <div className="flex-1 min-w-0 flex flex-col justify-center h-[140px]">
-                        <div className="flex-1 flex flex-col justify-between">
-                          <div>
-                            <div className="flex items-start justify-between mb-3">
-                              <h3 className="text-xl font-semibold text-white truncate pr-2">
-                                {video.title}
-                              </h3>
-                              {activeStream === video.id && (
-                                <Badge
-                                  variant="secondary"
-                                  className="ml-2 bg-green-900/50 text-green-300 border-green-700 flex-shrink-0"
-                                >
-                                  <Radio className="w-3 h-3 mr-1" />
-                                  Streaming
-                                </Badge>
-                              )}
-                            </div>
-                            <p className="text-sm text-gray-300 mb-2 leading-relaxed">
-                              {video.description}
-                            </p>
-                            <p className="text-xs text-gray-400 mb-4">
-                              {video.filename}
-                            </p>
-                          </div>
-
-                          <div className="flex gap-2">
-                            {activeStream === video.id ? (
-                              <Button
-                                onClick={handleStopStream}
-                                variant="outline"
-                                size="default"
-                                className="text-custom-red border-custom-red hover:bg-custom-red hover:text-white bg-transparent"
+                      <div className="flex-1 min-w-0 flex flex-col justify-between h-[140px] max-h-[140px] overflow-hidden">
+                        <div>
+                          <div className="flex items-start justify-between mb-2">
+                            <h3 className="text-xl font-semibold text-white truncate pr-2">
+                              {video.title}
+                            </h3>
+                            {activeStream === video.id && (
+                              <Badge
+                                variant="secondary"
+                                className="ml-2 bg-green-900/50 text-green-300 border-green-700 flex-shrink-0"
                               >
-                                Stop Stream
-                              </Button>
-                            ) : (
-                              <Button
-                                onClick={() => handleStartStream(video)}
-                                disabled={
-                                  loadingVideoId === video.id || !!activeStream
-                                }
-                                size="default"
-                                className="bg-custom-red hover:bg-custom-red/90 border-custom-red text-white disabled:opacity-50 disabled:cursor-not-allowed"
-                              >
-                                {loadingVideoId === video.id ? (
-                                  <>
-                                    <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                                    Starting...
-                                  </>
-                                ) : (
-                                  <>
-                                    <Play className="w-4 h-4 mr-2" />
-                                    Start Live Stream
-                                  </>
-                                )}
-                              </Button>
+                                <Radio className="w-3 h-3 mr-1" />
+                                Streaming
+                              </Badge>
                             )}
                           </div>
+                          <p className="text-sm text-gray-300 leading-relaxed line-clamp-2">
+                            {video.description}
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          {activeStream === video.id ? (
+                            <Button
+                              onClick={handleStopStream}
+                              variant="outline"
+                              size="default"
+                              className="text-custom-red border-custom-red hover:bg-custom-red hover:text-white bg-transparent"
+                            >
+                              Stop Stream
+                            </Button>
+                          ) : (
+                            <Button
+                              onClick={() => handleStartStream(video)}
+                              disabled={
+                                loadingVideoId === video.id || !!activeStream
+                              }
+                              size="default"
+                              className="bg-custom-red hover:bg-custom-red/90 border-custom-red text-white disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {loadingVideoId === video.id ? (
+                                <>
+                                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                  Starting...
+                                </>
+                              ) : (
+                                <>
+                                  <Play className="w-4 h-4 mr-2" />
+                                  Start Live Stream
+                                </>
+                              )}
+                            </Button>
+                          )}
                         </div>
                       </div>
                     </div>
@@ -363,31 +415,40 @@ export default function VideoProcessingUI() {
             <CardContent>
               <div className="aspect-video bg-gray-900 rounded-lg overflow-hidden relative border border-gray-700">
                 {streamStarted && activeVideo ? (
-                  <div className="w-full h-full flex flex-col">
-                    {/* Simulated video stream */}
-                    <div className="flex-1 bg-gradient-to-br from-blue-900 via-purple-900 to-pink-900 flex items-center justify-center relative">
-                      <div className="text-center text-white">
-                        <Radio className="w-12 h-12 mx-auto mb-4 animate-pulse" />
-                        <h3 className="text-lg font-semibold mb-2">
+                  <div className="w-full h-full flex flex-col relative">
+                    {/* Mostra il frame processato da AWS (s3_url) */}
+                    {lastProcessedFrame ? (
+                      <img
+                        src={lastProcessedFrame}
+                        alt="Processed frame"
+                        className="w-full h-full object-contain bg-black rounded-lg"
+                        style={{ maxHeight: "100%", maxWidth: "100%" }}
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-gray-500 bg-black rounded-lg">
+                        <span>Nessun frame processato ancora</span>
+                      </div>
+                    )}
+                    {/* Overlay info */}
+                    <div className="absolute top-4 left-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
+                      Processing: {activeVideo.filename}
+                    </div>
+                    <div className="absolute bottom-4 right-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
+                      1080p • 30fps
+                    </div>
+                    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+                      <div className="flex flex-col items-center">
+                        <Radio className="w-12 h-12 mx-auto mb-4 animate-pulse text-white" />
+                        <h3 className="text-lg font-semibold mb-2 text-white">
                           Live Processing
                         </h3>
-                        <p className="text-sm opacity-80">
+                        <p className="text-sm opacity-80 text-white">
                           {activeVideo.title}
                         </p>
                         <div className="mt-4 flex items-center justify-center gap-2">
                           <div className="w-2 h-2 bg-custom-red rounded-full animate-pulse"></div>
-                          <span className="text-xs">LIVE</span>
+                          <span className="text-xs text-white">LIVE</span>
                         </div>
-                      </div>
-
-                      {/* Simulated processing overlay */}
-                      <div className="absolute top-4 left-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
-                        Processing: {activeVideo.filename}
-                      </div>
-
-                      {/* Simulated stream info */}
-                      <div className="absolute bottom-4 right-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
-                        1080p • 30fps
                       </div>
                     </div>
                   </div>
