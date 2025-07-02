@@ -13,5 +13,5 @@ class StreamStack(Stack):
             self,
             "InputStream",
             name="video-input-stream",
-            retention_period_hours=1,
+            data_retention_in_hours=1,
         )
