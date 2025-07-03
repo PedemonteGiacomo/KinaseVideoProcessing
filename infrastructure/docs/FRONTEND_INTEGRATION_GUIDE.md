@@ -26,7 +26,7 @@ graph TB
         KDS -->|Auto-trigger| ECS
         ECS -->|Upload| S3
         ECS -->|JSON Results| SQS
-        SQS -->|Polling 1.5s| UI
+        SQS -->|Polling| UI
         UI -->|Display Frame| VIDEO
     end
     
