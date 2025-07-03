@@ -423,6 +423,8 @@ export default function VideoProcessingUI() {
   };
 
   const handleStopStream = () => {
+    // Cancella i log quando la live viene stoppata
+    setLogs([]);
     addLog("⏹️ Stop stream richiesto dall'utente", "info");
 
     setActiveStream(null);
@@ -443,8 +445,6 @@ export default function VideoProcessingUI() {
       videoElement.remove();
       videoElement = null;
     }
-
-    addLog("✅ Stream stoppato completamente", "info");
   };
 
   return (
@@ -598,20 +598,12 @@ export default function VideoProcessingUI() {
                     <div className="absolute bottom-4 right-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
                       1080p • 30fps
                     </div>
-                    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
-                      <div className="flex flex-col items-center">
-                        <Radio className="w-12 h-12 mx-auto mb-4 animate-pulse text-white" />
-                        <h3 className="text-lg font-semibold mb-2 text-white">
-                          Live Processing
-                        </h3>
-                        <p className="text-sm opacity-80 text-white">
-                          {activeVideo.title}
-                        </p>
-                        <div className="mt-4 flex items-center justify-center gap-2">
-                          <div className="w-2 h-2 bg-custom-red rounded-full animate-pulse"></div>
-                          <span className="text-xs text-white">LIVE</span>
-                        </div>
-                      </div>
+                    {/* Streaming icon in top right */}
+                    <div className="absolute top-4 right-4 flex items-center gap-2">
+                      <Radio className="w-8 h-8 animate-pulse text-white" />
+                      <span className="text-xs text-white font-semibold bg-custom-red/80 rounded px-2 py-1">
+                        LIVE
+                      </span>
                     </div>
                   </div>
                 ) : (
