@@ -85,16 +85,19 @@ async function cleanupOldMessages() {
     accessKeyId: AWS_ACCESS_KEY_ID as string,
     secretAccessKey: AWS_SECRET_ACCESS_KEY as string,
   });
-  
+
   let cleanedCount = 0;
   let consecutiveEmptyAttempts = 0;
   const maxEmptyAttempts = 3; // Ferma dopo 3 tentativi consecutivi senza messaggi
   const maxTotalAttempts = 30; // Limite massimo per evitare loop infiniti
   let totalAttempts = 0;
-  
+
   console.log("🧹 Inizio cleanup coda SQS FIFO...");
-  
-  while (consecutiveEmptyAttempts < maxEmptyAttempts && totalAttempts < maxTotalAttempts) {
+
+  while (
+    consecutiveEmptyAttempts < maxEmptyAttempts &&
+    totalAttempts < maxTotalAttempts
+  ) {
     try {
       const params = {
         QueueUrl: SQS_QUEUE_URL as string,
@@ -102,57 +105,65 @@ async function cleanupOldMessages() {
         WaitTimeSeconds: 0, // Polling immediato per cleanup veloce
         VisibilityTimeout: 1, // Timeout breve per cleanup aggressivo
       };
-      
+
       const data = await sqs.receiveMessage(params).promise();
-      
+
       if (!data.Messages || data.Messages.length === 0) {
         consecutiveEmptyAttempts++;
         totalAttempts++;
         // Breve pausa prima del prossimo tentativo
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise((resolve) => setTimeout(resolve, 100));
         continue;
       }
-      
+
       // Reset counter se troviamo messaggi
       consecutiveEmptyAttempts = 0;
       totalAttempts++;
-      
+
       // Elimina tutti i messaggi trovati in parallelo
-      const deletePromises = data.Messages.map(message => 
-        sqs.deleteMessage({
-          QueueUrl: SQS_QUEUE_URL as string,
-          ReceiptHandle: message.ReceiptHandle as string,
-        }).promise().catch(err => {
-          // Log dell'errore ma continua con gli altri
-          console.warn("Errore eliminazione singolo messaggio:", err);
-          return null;
-        })
+      const deletePromises = data.Messages.map((message) =>
+        sqs
+          .deleteMessage({
+            QueueUrl: SQS_QUEUE_URL as string,
+            ReceiptHandle: message.ReceiptHandle as string,
+          })
+          .promise()
+          .catch((err) => {
+            // Log dell'errore ma continua con gli altri
+            console.warn("Errore eliminazione singolo messaggio:", err);
+            return null;
+          })
       );
-      
+
       const results = await Promise.allSettled(deletePromises);
-      const successfulDeletes = results.filter(r => r.status === 'fulfilled').length;
+      const successfulDeletes = results.filter(
+        (r) => r.status === "fulfilled"
+      ).length;
       cleanedCount += successfulDeletes;
-      
-      console.log(`🗑️ Eliminati ${successfulDeletes}/${data.Messages.length} messaggi (totale: ${cleanedCount})`);
-      
+
+      console.log(
+        `🗑️ Eliminati ${successfulDeletes}/${data.Messages.length} messaggi (totale: ${cleanedCount})`
+      );
+
       // Pausa più breve tra i batch per essere più aggressivi
-      await new Promise(resolve => setTimeout(resolve, 25));
-      
+      await new Promise((resolve) => setTimeout(resolve, 25));
     } catch (error) {
       console.error("❌ Errore durante cleanup coda:", error);
       // Su errore, aumenta il counter per evitare loop infiniti
       consecutiveEmptyAttempts++;
       totalAttempts++;
-      await new Promise(resolve => setTimeout(resolve, 200));
+      await new Promise((resolve) => setTimeout(resolve, 200));
     }
   }
-  
+
   if (cleanedCount > 0) {
-    console.log(`✅ Cleanup completato: ${cleanedCount} messaggi rimossi dalla coda FIFO`);
+    console.log(
+      `✅ Cleanup completato: ${cleanedCount} messaggi rimossi dalla coda FIFO`
+    );
   } else {
     console.log("✅ Coda già vuota");
   }
-  
+
   return cleanedCount;
 }
 
@@ -229,12 +240,15 @@ export default function VideoProcessingUI() {
       if (Array.isArray(results)) {
         if (results.length === 0) {
           // Nessun messaggio ricevuto - incrementa contatore
-          setConsecutiveEmptyPolls(prev => {
+          setConsecutiveEmptyPolls((prev) => {
             const newCount = prev + 1;
             // Se abbiamo 5 polling consecutivi vuoti (7.5 secondi), consideriamo lo stream terminato
             if (newCount >= 5) {
               setStreamEnded(true);
-              addLog("Stream terminato - nessun frame in processamento", "info");
+              addLog(
+                "Stream terminato - nessun frame in processamento",
+                "info"
+              );
             }
             return newCount;
           });
@@ -242,7 +256,7 @@ export default function VideoProcessingUI() {
           // Reset contatore se riceviamo messaggi
           setConsecutiveEmptyPolls(0);
           setStreamEnded(false);
-          
+
           results.forEach((r) => {
             // 3.1 URL S3
             const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
@@ -252,7 +266,10 @@ export default function VideoProcessingUI() {
             setLastDetections(r.detections_count);
 
             // 3.3 log sintetico
-            addLog(`Frame #${r.frame_index} → ${r.detections_count} objects`, "info");
+            addLog(
+              `Frame #${r.frame_index} → ${r.detections_count} objects`,
+              "info"
+            );
 
             // 3.4 log dettaglio per oggetto
             r.summary?.forEach((d: any) =>
@@ -273,7 +290,7 @@ export default function VideoProcessingUI() {
       setWsConnected(true);
       addLog("WebSocket connected (simulato)", "info");
       addLog(`Starting object detection for ${activeVideo.filename}`, "info");
-      pollingInterval = setInterval(pollSQS, 1500);
+      pollingInterval = setInterval(pollSQS, 300); // Poll più frequente per maggiore fluidità
     } else {
       if (wsConnected) {
         setWsConnected(false);
@@ -287,9 +304,11 @@ export default function VideoProcessingUI() {
     };
   }, [streamStarted, activeVideo, wsConnected]);
 
+  // Generate a unique id for each log (timestamp + random string)
   const addLog = (message: string, type: "info" | "detection" | "error") => {
+    const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
     const newLog = {
-      id: Date.now().toString(),
+      id: uniqueId,
       timestamp: new Date().toLocaleTimeString(),
       message,
       type,
@@ -304,7 +323,7 @@ export default function VideoProcessingUI() {
 
   // Helper: cattura un frame dal <video> e lo invia a Kinesis come bytes JPEG
   const captureAndSendFrame = async (video: HTMLVideoElement) => {
-    if (video.readyState < 2) return;           // il video non è ancora pronto
+    if (video.readyState < 2) return; // il video non è ancora pronto
 
     // — opzionale: ridimensiona per stare sotto 1 MB —
     const MAX_W = 640;
@@ -323,7 +342,7 @@ export default function VideoProcessingUI() {
       async (blob) => {
         if (!blob) return;
         const arrayBuffer = await blob.arrayBuffer();
-        const frameBytes = new Uint8Array(arrayBuffer);   // <-- bytes grezzi
+        const frameBytes = new Uint8Array(arrayBuffer); // <-- bytes grezzi
 
         const res = await sendVideoFrame(frameBytes);
         if (res !== true) {
@@ -335,10 +354,9 @@ export default function VideoProcessingUI() {
         }
       },
       "image/jpeg",
-      0.8        // qualità/compressione JPEG (0-1)
+      0.8 // qualità/compressione JPEG (0-1)
     );
   };
-
 
   // Start streaming: play video, extract frames, send to Kinesis
   const handleStartStream = async (video: DemoVideo) => {
@@ -351,7 +369,7 @@ export default function VideoProcessingUI() {
     setLastProcessedFrame(null);
     setLastDetections(0);
     setLogs([]); // Pulisci SEMPRE i log precedenti
-    
+
     // 🧹 CLEANUP: Svuota SEMPRE la coda prima di iniziare nuovo stream
     addLog("🧹 Pulizia coda in corso...", "info");
     try {
@@ -364,14 +382,14 @@ export default function VideoProcessingUI() {
     } catch (error) {
       addLog("❌ Errore durante cleanup coda: " + String(error), "error");
     }
-    
+
     // Ora avvia effettivamente lo stream
     addLog(`🎬 Avvio stream: ${video.title}`, "info");
-    
+
     setTimeout(() => {
       setStreamStarted(true); // Ora è veramente started
       setLoadingVideoId(null);
-      
+
       setTimeout(() => {
         // Create hidden video element for frame extraction
         if (!videoElement) {
@@ -386,10 +404,10 @@ export default function VideoProcessingUI() {
           // Se esiste già, aggiorna solo il src
           videoElement.src = `/videos/${video.filename}`;
         }
-        
+
         videoElement.currentTime = 0;
         videoElement.play();
-        
+
         // Start frame extraction loop (10 FPS)
         frameInterval = setInterval(() => {
           if (videoElement && !videoElement.paused && !videoElement.ended) {
@@ -406,7 +424,7 @@ export default function VideoProcessingUI() {
 
   const handleStopStream = () => {
     addLog("⏹️ Stop stream richiesto dall'utente", "info");
-    
+
     setActiveStream(null);
     setStreamStarted(false);
     setStreamEnded(false);
@@ -414,7 +432,7 @@ export default function VideoProcessingUI() {
     setWsConnected(false);
     setLastProcessedFrame(null);
     setLastDetections(0);
-    
+
     // Stop frame extraction
     if (frameInterval) {
       clearInterval(frameInterval);
@@ -425,7 +443,7 @@ export default function VideoProcessingUI() {
       videoElement.remove();
       videoElement = null;
     }
-    
+
     addLog("✅ Stream stoppato completamente", "info");
   };
 
@@ -458,10 +476,11 @@ export default function VideoProcessingUI() {
                 {demoVideos.map((video) => (
                   <div
                     key={video.id}
-                    className={`border rounded-lg p-5 transition-all hover:shadow-lg ${activeStream === video.id
+                    className={`border rounded-lg p-5 transition-all hover:shadow-lg ${
+                      activeStream === video.id
                         ? "border-custom-red bg-custom-red/10"
                         : "border-gray-600 bg-gray-700/50 hover:bg-gray-700"
-                      }`}
+                    }`}
                   >
                     <div className="flex gap-5 items-center">
                       <div className="relative flex-shrink-0 w-[140px] h-[140px]">
@@ -612,30 +631,37 @@ export default function VideoProcessingUI() {
               </div>
 
               {streamStarted && (
-                <div className={`mt-4 p-3 border rounded-lg ${streamEnded 
-                  ? "bg-orange-900/20 border-orange-700" 
-                  : "bg-green-900/20 border-green-700"
-                }`}>
+                <div
+                  className={`mt-4 p-3 border rounded-lg ${
+                    streamEnded
+                      ? "bg-orange-900/20 border-orange-700"
+                      : "bg-green-900/20 border-green-700"
+                  }`}
+                >
                   <div className="flex items-center gap-2">
-                    <div className={`w-2 h-2 rounded-full ${streamEnded 
-                      ? "bg-orange-500" 
-                      : "bg-green-500 animate-pulse"
-                    }`}></div>
-                    <span className={`text-sm font-medium ${streamEnded 
-                      ? "text-orange-300" 
-                      : "text-green-300"
-                    }`}>
+                    <div
+                      className={`w-2 h-2 rounded-full ${
+                        streamEnded
+                          ? "bg-orange-500"
+                          : "bg-green-500 animate-pulse"
+                      }`}
+                    ></div>
+                    <span
+                      className={`text-sm font-medium ${
+                        streamEnded ? "text-orange-300" : "text-green-300"
+                      }`}
+                    >
                       {streamEnded ? "Stream Terminato" : "Stream Active"}
                     </span>
                   </div>
-                  <p className={`text-xs mt-1 ${streamEnded 
-                    ? "text-orange-400" 
-                    : "text-green-400"
-                  }`}>
-                    {streamEnded 
+                  <p
+                    className={`text-xs mt-1 ${
+                      streamEnded ? "text-orange-400" : "text-green-400"
+                    }`}
+                  >
+                    {streamEnded
                       ? "Il video è terminato, nessun frame in processamento"
-                      : "Receiving processed video from AWS pipeline"
-                    }
+                      : "Receiving processed video from AWS pipeline"}
                   </p>
                 </div>
               )}
@@ -645,10 +671,11 @@ export default function VideoProcessingUI() {
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-2">
                     <div
-                      className={`w-2 h-2 rounded-full ${wsConnected
+                      className={`w-2 h-2 rounded-full ${
+                        wsConnected
                           ? "bg-green-500 animate-pulse"
                           : "bg-gray-500"
-                        }`}
+                      }`}
                     ></div>
                     <h3 className="text-lg font-semibold text-white">
                       Processing Logs
@@ -688,12 +715,13 @@ export default function VideoProcessingUI() {
                             [{log.timestamp}]
                           </span>
                           <span
-                            className={`flex-1 ${log.type === "detection"
+                            className={`flex-1 ${
+                              log.type === "detection"
                                 ? "text-green-400"
                                 : log.type === "error"
-                                  ? "text-red-400"
-                                  : "text-gray-300"
-                              }`}
+                                ? "text-red-400"
+                                : "text-gray-300"
+                            }`}
                           >
                             {log.message}
                           </span>
@@ -707,8 +735,9 @@ export default function VideoProcessingUI() {
                   <div className="mt-4 flex items-center justify-between text-xs">
                     <div className="flex items-center gap-2 text-gray-400">
                       <div
-                        className={`w-1.5 h-1.5 rounded-full ${wsConnected ? "bg-green-500" : "bg-red-500"
-                          }`}
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          wsConnected ? "bg-green-500" : "bg-red-500"
+                        }`}
                       ></div>
                       WebSocket: {wsConnected ? "Connected" : "Disconnected"}
                     </div>
