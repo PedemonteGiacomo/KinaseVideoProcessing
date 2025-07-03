@@ -12,125 +12,16 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Play, Loader2, Radio } from "lucide-react";
 import Image from "next/image";
-
-const AWS_REGION = process.env.NEXT_PUBLIC_AWS_REGION;
-const AWS_ACCESS_KEY_ID = process.env.NEXT_PUBLIC_AWS_ACCESS_KEY_ID;
-const AWS_SECRET_ACCESS_KEY = process.env.NEXT_PUBLIC_AWS_SECRET_ACCESS_KEY;
-const KINESIS_STREAM_NAME = process.env.NEXT_PUBLIC_KINESIS_STREAM_NAME;
-const SQS_QUEUE_URL = process.env.NEXT_PUBLIC_SQS_QUEUE_URL;
-
-// Send a video frame to Kinesis
-async function sendVideoFrame(videoData: Uint8Array | Buffer | string) {
-  if (typeof window === "undefined") return;
-  const AWS = (await import("aws-sdk")).default;
-  const kinesis = new AWS.Kinesis({
-    region: AWS_REGION as string,
-    accessKeyId: AWS_ACCESS_KEY_ID as string,
-    secretAccessKey: AWS_SECRET_ACCESS_KEY as string,
-  });
-  const params = {
-    StreamName: KINESIS_STREAM_NAME as string,
-    Data: videoData,
-    PartitionKey: "video-processing",
-  };
-  try {
-    await kinesis.putRecord(params).promise();
-    return true;
-  } catch (error) {
-    // error handling will be in the UI
-    return error;
-  }
-}
-
-// Receive detection results from SQS
-async function receiveLiveVideo() {
-  if (typeof window === "undefined") return [];
-  const AWS = (await import("aws-sdk")).default;
-  const sqs = new AWS.SQS({
-    region: AWS_REGION as string,
-    accessKeyId: AWS_ACCESS_KEY_ID as string,
-    secretAccessKey: AWS_SECRET_ACCESS_KEY as string,
-  });
-  const params = {
-    QueueUrl: SQS_QUEUE_URL as string,
-    MaxNumberOfMessages: 10,
-    WaitTimeSeconds: 2,
-  };
-  try {
-    const data = await sqs.receiveMessage(params).promise();
-    if (data.Messages) {
-      for (const message of data.Messages) {
-        // Delete message after processing
-        await sqs
-          .deleteMessage({
-            QueueUrl: SQS_QUEUE_URL as string,
-            ReceiptHandle: message.ReceiptHandle as string,
-          })
-          .promise();
-      }
-      return data.Messages.map((msg) => JSON.parse(msg.Body!));
-    }
-    return [];
-  } catch (error) {
-    return error;
-  }
-}
-
-interface DemoVideo {
-  id: string;
-  title: string;
-  filename: string;
-  thumbnail: string;
-  description: string;
-}
-
-const demoVideos: DemoVideo[] = [
-  {
-    id: "1",
-    title: "Cafe Table",
-    filename: "cafe.mp4",
-    thumbnail: "/videos/thumbnails/cafe.png?height=120&width=200",
-    description:
-      "Close-up table scene with a cup, bottle, phone and book in a cozy cafe.",
-  },
-  {
-    id: "2",
-    title: "Office Desk",
-    filename: "office.mp4",
-    thumbnail: "/videos/thumbnails/office.png?height=120&width=200",
-    description:
-      "Person working at a laptop with a cup, phone, bottle and books visible on the desk.",
-  },
-  {
-    id: "3",
-    title: "Reading Corner",
-    filename: "reading.mp4",
-    thumbnail: "/videos/thumbnails/reading.png?height=120&width=200",
-    description:
-      "Person sitting on a chair reading a book near a table with cup, bottle and phone.",
-  },
-  {
-    id: "4",
-    title: "Waiting Room",
-    filename: "waiting-room.mp4",
-    thumbnail: "/videos/thumbnails/waiting-room.png?height=120&width=200",
-    description:
-      "Chairs in a waiting area, with people reading, on phones, and a bottle on the floor.",
-  },
-];
+import { sendVideoFrame, receiveLiveVideo } from "./lib/aws";
+import { demoVideos } from "./lib/demoVideos";
+import { DemoVideo } from "./types/video";
+import { useLogs } from "./hooks/useLogs";
 
 export default function VideoProcessingUI() {
   const [activeStream, setActiveStream] = useState<string | null>(null);
   const [loadingVideoId, setLoadingVideoId] = useState<string | null>(null);
   const [streamStarted, setStreamStarted] = useState(false);
-  const [logs, setLogs] = useState<
-    Array<{
-      id: string;
-      timestamp: string;
-      message: string;
-      type: "info" | "detection" | "error";
-    }>
-  >([]);
+  const { logs, addLog, clearLogs } = useLogs([]);
   const [wsConnected, setWsConnected] = useState(false);
   const [lastProcessedFrame, setLastProcessedFrame] = useState<string | null>(
     null
@@ -185,7 +76,7 @@ export default function VideoProcessingUI() {
           }
           lastFrameIndexRef.current =
             r.frame_index ?? lastFrameIndexRef.current;
-          const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
+          const url = `https://${r.bucket}.s3.${process.env.NEXT_PUBLIC_AWS_REGION}.amazonaws.com/${r.key}`;
           setLastProcessedFrame(url);
           setLastDetections(r.detections_count);
           addLog(
@@ -233,19 +124,7 @@ export default function VideoProcessingUI() {
     };
   }, [streamStarted, activeVideo]);
 
-  const addLog = (message: string, type: "info" | "detection" | "error") => {
-    const uniqueId =
-      typeof crypto !== "undefined" && crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-    const newLog = {
-      id: uniqueId,
-      timestamp: new Date().toLocaleTimeString(),
-      message,
-      type,
-    };
-    setLogs((prev) => [...prev.slice(-49), newLog]); // Keep last 50 logs
-  };
+  // addLog e clearLogs ora vengono da useLogs
 
   // --- Video frame extraction and Kinesis integration ---
   let videoElement: HTMLVideoElement | null = null;
@@ -326,7 +205,7 @@ export default function VideoProcessingUI() {
   const handleStopStream = () => {
     setActiveStream(null);
     setStreamStarted(false);
-    setLogs([]);
+    clearLogs();
     setWsConnected(false);
     setLastProcessedFrame(null);
     setLastDetections(0);
@@ -353,7 +232,7 @@ export default function VideoProcessingUI() {
     setLastDetections(0);
     setFrameResolution(null);
     lastFrameIndexRef.current = -1;
-    setLogs([]);
+    clearLogs();
     setLoadingVideoId(video.id);
     setTimeout(() => {
       setActiveStream(video.id);
@@ -599,7 +478,7 @@ export default function VideoProcessingUI() {
                   </div>
                   {logs.length > 0 && (
                     <Button
-                      onClick={() => setLogs([])}
+                      onClick={clearLogs}
                       variant="outline"
                       size="sm"
                       className="text-gray-300 border-gray-600 hover:bg-gray-700"
