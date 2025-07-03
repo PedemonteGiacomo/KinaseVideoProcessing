@@ -28,15 +28,22 @@ export default function VideoProcessingUI() {
   );
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const pollingDelayRef = useRef<number>(100); // intervallo polling dinamico
   const isPollingActive = useRef(false);
   const [lastDetections, setLastDetections] = useState<number>(0);
   const [frameResolution, setFrameResolution] = useState<{
     w: number;
     h: number;
   } | null>(null);
+  // Stato per timeout stream
+  const [streamEnded, setStreamEnded] = useState(false);
+  const lastFrameTimeRef = useRef<number | null>(null);
+  const pollingStartTimeRef = useRef<number | null>(null);
+  const GRACE_PERIOD_MS = 5000; // 5 secondi di attesa iniziale
+  const STREAM_END_TIMEOUT_MS = 2500; // 4 secondi di tolleranza per fine stream
   const streamStartTimeRef = useRef<number | null>(null);
   const lastFrameIndexRef = useRef<number>(-1);
-  const FRAME_SHOW_DELAY = 1500; // ms
+  const FRAME_SHOW_DELAY = 0; // ms
 
   const activeVideo = demoVideos.find((v) => v.id === activeStream);
 
@@ -50,9 +57,12 @@ export default function VideoProcessingUI() {
     }
 
     async function pollSQS() {
-      if (!isPollingActive.current) return;
+      if (!isPollingActive.current || !streamStarted) return;
       const results = await receiveLiveVideo();
-      if (!isPollingActive.current) return;
+      if (!isPollingActive.current || !streamStarted) return;
+      let newFrameReceived = false;
+      let maxFrame = null;
+      let maxFrameIndex = lastFrameIndexRef.current;
       if (Array.isArray(results)) {
         // Ritardo iniziale: ignora i frame per i primi FRAME_SHOW_DELAY ms
         if (
@@ -63,30 +73,36 @@ export default function VideoProcessingUI() {
         }
         // Filtro solo i frame del video attivo (usando filename)
         const currentFilename = activeVideo?.filename;
-        results.forEach((r) => {
+        for (const r of results) {
           if (currentFilename && r.filename && r.filename !== currentFilename) {
-            return; // ignora frame di altri video
+            continue; // ignora frame di altri video
           }
-          // Mostra solo frame con frame_index maggiore di quello già visualizzato
           if (
             typeof r.frame_index === "number" &&
-            r.frame_index <= lastFrameIndexRef.current
+            r.frame_index > maxFrameIndex
           ) {
-            return;
+            maxFrameIndex = r.frame_index;
+            maxFrame = r;
           }
-          lastFrameIndexRef.current =
-            r.frame_index ?? lastFrameIndexRef.current;
-          const url = `https://${r.bucket}.s3.${process.env.NEXT_PUBLIC_AWS_REGION}.amazonaws.com/${r.key}`;
+        }
+        if (
+          maxFrame &&
+          typeof maxFrame.frame_index === "number" &&
+          maxFrame.frame_index > lastFrameIndexRef.current
+        ) {
+          lastFrameIndexRef.current = maxFrame.frame_index;
+          const url = `https://${maxFrame.bucket}.s3.${process.env.NEXT_PUBLIC_AWS_REGION}.amazonaws.com/${maxFrame.key}`;
           setLastProcessedFrame(url);
-          setLastDetections(r.detections_count);
+          setLastDetections(maxFrame.detections_count);
           addLog(
-            `Frame #${r.frame_index} → ${r.detections_count} objects`,
+            `Frame #${maxFrame.frame_index} → ${maxFrame.detections_count} objects`,
             "info"
           );
-          r.summary?.forEach((d: any) =>
+          maxFrame.summary?.forEach((d: any) =>
             addLog(`${d.class} ${(d.conf * 100).toFixed(0)}%`, "detection")
           );
-        });
+          newFrameReceived = true;
+        }
       } else if (results) {
         const errMsg =
           typeof results === "object" && results && "message" in results
@@ -94,41 +110,122 @@ export default function VideoProcessingUI() {
             : String(results);
         addLog("Errore ricezione risultati: " + errMsg, "error");
       }
+      // Timeout: se non arrivano frame nuovi per 1 secondo, termina stream
+      const now = Date.now();
+      if (newFrameReceived) {
+        lastFrameTimeRef.current = now;
+        setStreamEnded(false);
+        // Torna a polling veloce
+        if (pollingDelayRef.current !== 100) {
+          pollingDelayRef.current = 100;
+          if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current);
+            pollingIntervalRef.current = null;
+          }
+          pollingIntervalRef.current = setInterval(
+            pollSQS,
+            pollingDelayRef.current
+          );
+        }
+      } else {
+        // Se non abbiamo mai ricevuto frame, aspetta almeno il grace period
+        if (
+          !lastFrameTimeRef.current &&
+          pollingStartTimeRef.current &&
+          now - pollingStartTimeRef.current < GRACE_PERIOD_MS
+        ) {
+          // ancora in grace period, non terminare lo stream
+          return;
+        }
+        // Se non riceviamo frame da un po', rallenta polling
+        if (
+          lastFrameTimeRef.current &&
+          now - lastFrameTimeRef.current > 1000 &&
+          pollingDelayRef.current === 100
+        ) {
+          pollingDelayRef.current = 500;
+          if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current);
+            pollingIntervalRef.current = null;
+          }
+          pollingIntervalRef.current = setInterval(
+            pollSQS,
+            pollingDelayRef.current
+          );
+        }
+        // Timeout più tollerante per la fine stream
+        if (
+          lastFrameTimeRef.current &&
+          now - lastFrameTimeRef.current > STREAM_END_TIMEOUT_MS &&
+          !streamEnded
+        ) {
+          setStreamEnded(true);
+          isPollingActive.current = false;
+          if (pollingIntervalRef.current) {
+            clearInterval(pollingIntervalRef.current);
+            pollingIntervalRef.current = null;
+          }
+          addLog("Stream terminato: nessun nuovo frame ricevuto.", "info");
+        }
+      }
     }
-
     if (streamStarted && activeVideo) {
       setWsConnected(true);
       addLog("WebSocket connected (simulato)", "info");
       addLog(`Starting object detection for ${activeVideo.filename}`, "info");
       isPollingActive.current = true;
-      pollingIntervalRef.current = setInterval(pollSQS, 100); // 10 FPS polling
+      setStreamEnded(false);
+      setLastProcessedFrame(null);
+      setLastDetections(0);
+      setFrameResolution(null);
+      lastFrameIndexRef.current = -1;
+      lastFrameTimeRef.current = null;
+      pollingStartTimeRef.current = Date.now();
+      pollingDelayRef.current = 100;
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
+      pollingIntervalRef.current = setInterval(
+        pollSQS,
+        pollingDelayRef.current
+      );
     } else {
       if (wsConnected) {
         setWsConnected(false);
         addLog("WebSocket disconnected", "info");
       }
       setLastProcessedFrame(null);
+      setLastDetections(0);
+      setFrameResolution(null);
       isPollingActive.current = false;
+      setStreamEnded(false);
+      lastFrameIndexRef.current = -1;
+      lastFrameTimeRef.current = null;
+      pollingStartTimeRef.current = null;
+      pollingDelayRef.current = 100;
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
         pollingIntervalRef.current = null;
       }
     }
-
     return () => {
       isPollingActive.current = false;
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
         pollingIntervalRef.current = null;
       }
+      setStreamEnded(false);
+      lastFrameTimeRef.current = null;
+      pollingStartTimeRef.current = null;
     };
   }, [streamStarted, activeVideo]);
 
   // addLog e clearLogs ora vengono da useLogs
 
   // --- Video frame extraction and Kinesis integration ---
-  let videoElement: HTMLVideoElement | null = null;
-  let frameInterval: NodeJS.Timeout | null = null;
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
+  const frameIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Draw the latest frame on canvas when it changes
   useEffect(() => {
@@ -218,11 +315,14 @@ export default function VideoProcessingUI() {
       pollingIntervalRef.current = null;
     }
     // Stop frame extraction
-    if (frameInterval) clearInterval(frameInterval);
-    if (videoElement) {
-      videoElement.pause();
-      videoElement.remove();
-      videoElement = null;
+    if (frameIntervalRef.current) {
+      clearInterval(frameIntervalRef.current);
+      frameIntervalRef.current = null;
+    }
+    if (videoElementRef.current) {
+      videoElementRef.current.pause();
+      videoElementRef.current.remove();
+      videoElementRef.current = null;
     }
   };
 
@@ -242,19 +342,27 @@ export default function VideoProcessingUI() {
       streamStartTimeRef.current = Date.now();
       setTimeout(() => {
         // Create hidden video element for frame extraction
-        if (!videoElement) {
-          videoElement = document.createElement("video");
-          videoElement.src = `/videos/${video.filename}`;
-          videoElement.crossOrigin = "anonymous";
-          videoElement.muted = true;
-          videoElement.playsInline = true;
-          videoElement.style.display = "none";
-          document.body.appendChild(videoElement);
+        if (!videoElementRef.current) {
+          const vid = document.createElement("video");
+          vid.src = `/videos/${video.filename}`;
+          vid.crossOrigin = "anonymous";
+          vid.muted = true;
+          vid.playsInline = true;
+          vid.style.display = "none";
+          document.body.appendChild(vid);
+          videoElementRef.current = vid;
         }
-        videoElement.currentTime = 0;
-        videoElement.play();
+        const videoElement = videoElementRef.current;
+        if (videoElement) {
+          videoElement.currentTime = 0;
+          videoElement.play();
+        }
         // Start frame extraction loop (10 FPS)
-        frameInterval = setInterval(() => {
+        if (frameIntervalRef.current) {
+          clearInterval(frameIntervalRef.current);
+        }
+        frameIntervalRef.current = setInterval(() => {
+          const videoElement = videoElementRef.current;
           if (videoElement && !videoElement.paused && !videoElement.ended) {
             captureAndSendFrame(videoElement);
           }
@@ -405,6 +513,14 @@ export default function VideoProcessingUI() {
                         {frameResolution && (
                           <div className="absolute bottom-4 right-4 bg-black/70 text-xs text-white px-2 py-1 rounded">
                             {frameResolution.w}x{frameResolution.h}
+                          </div>
+                        )}
+                        {/* Messaggio stream terminato */}
+                        {streamEnded && (
+                          <div className="absolute inset-0 flex items-center justify-center bg-black/70 z-10">
+                            <span className="text-lg text-white font-bold">
+                              Stream terminato
+                            </span>
                           </div>
                         )}
                       </>
