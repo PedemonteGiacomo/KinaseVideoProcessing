@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -134,34 +134,68 @@ export default function VideoProcessingUI() {
   const [wsConnected, setWsConnected] = useState(false);
   const [lastProcessedFrame, setLastProcessedFrame] = useState<string | null>(
     null
-  ); // s3_url
+  );
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pollingIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isPollingActive = useRef(false);
+  const [lastDetections, setLastDetections] = useState<number>(0);
+  const [frameResolution, setFrameResolution] = useState<{
+    w: number;
+    h: number;
+  } | null>(null);
+  const streamStartTimeRef = useRef<number | null>(null);
+  const lastFrameIndexRef = useRef<number>(-1);
+  const FRAME_SHOW_DELAY = 1500; // ms
 
   const activeVideo = demoVideos.find((v) => v.id === activeStream);
 
   useEffect(() => {
-    let pollingInterval: NodeJS.Timeout | null = null;
+    streamStartTimeRef.current = null;
+    lastFrameIndexRef.current = -1;
+    isPollingActive.current = false;
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
 
     async function pollSQS() {
+      if (!isPollingActive.current) return;
       const results = await receiveLiveVideo();
+      if (!isPollingActive.current) return;
       if (Array.isArray(results)) {
-        for (const result of results) {
-          if (result && result.detections) {
-            // Log each detection
-            result.detections.forEach((d: any) => {
-              addLog(
-                `Rilevato: ${d.class} (confidence: ${(
-                  d.confidence * 100
-                ).toFixed(1)}%) [${d.x}, ${d.y}, ${d.width}x${d.height}]`,
-                "detection"
-              );
-            });
-            // Aggiorna il frame processato
-            if (result.s3_url) {
-              setLastProcessedFrame(result.s3_url);
-              addLog(`Frame processato: ${result.s3_url}`, "info");
-            }
-          }
+        // Ritardo iniziale: ignora i frame per i primi FRAME_SHOW_DELAY ms
+        if (
+          streamStartTimeRef.current &&
+          Date.now() - streamStartTimeRef.current < FRAME_SHOW_DELAY
+        ) {
+          return;
         }
+        // Filtro solo i frame del video attivo (usando filename)
+        const currentFilename = activeVideo?.filename;
+        results.forEach((r) => {
+          if (currentFilename && r.filename && r.filename !== currentFilename) {
+            return; // ignora frame di altri video
+          }
+          // Mostra solo frame con frame_index maggiore di quello già visualizzato
+          if (
+            typeof r.frame_index === "number" &&
+            r.frame_index <= lastFrameIndexRef.current
+          ) {
+            return;
+          }
+          lastFrameIndexRef.current =
+            r.frame_index ?? lastFrameIndexRef.current;
+          const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
+          setLastProcessedFrame(url);
+          setLastDetections(r.detections_count);
+          addLog(
+            `Frame #${r.frame_index} → ${r.detections_count} objects`,
+            "info"
+          );
+          r.summary?.forEach((d: any) =>
+            addLog(`${d.class} ${(d.conf * 100).toFixed(0)}%`, "detection")
+          );
+        });
       } else if (results) {
         const errMsg =
           typeof results === "object" && results && "message" in results
@@ -175,23 +209,37 @@ export default function VideoProcessingUI() {
       setWsConnected(true);
       addLog("WebSocket connected (simulato)", "info");
       addLog(`Starting object detection for ${activeVideo.filename}`, "info");
-      pollingInterval = setInterval(pollSQS, 1500);
+      isPollingActive.current = true;
+      pollingIntervalRef.current = setInterval(pollSQS, 100); // 10 FPS polling
     } else {
       if (wsConnected) {
         setWsConnected(false);
         addLog("WebSocket disconnected", "info");
       }
       setLastProcessedFrame(null);
+      isPollingActive.current = false;
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
     }
 
     return () => {
-      if (pollingInterval) clearInterval(pollingInterval);
+      isPollingActive.current = false;
+      if (pollingIntervalRef.current) {
+        clearInterval(pollingIntervalRef.current);
+        pollingIntervalRef.current = null;
+      }
     };
   }, [streamStarted, activeVideo]);
 
   const addLog = (message: string, type: "info" | "detection" | "error") => {
+    const uniqueId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const newLog = {
-      id: Date.now().toString(),
+      id: uniqueId,
       timestamp: new Date().toLocaleTimeString(),
       message,
       type,
@@ -202,57 +250,117 @@ export default function VideoProcessingUI() {
   // --- Video frame extraction and Kinesis integration ---
   let videoElement: HTMLVideoElement | null = null;
   let frameInterval: NodeJS.Timeout | null = null;
-  let frameCount = 0;
 
-  // Helper: capture frame from video element and send to Kinesis
+  // Draw the latest frame on canvas when it changes
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!lastProcessedFrame) {
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      setFrameResolution(null);
+      return;
+    }
+    const img = new window.Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      // Adatta il canvas alla dimensione del frame la prima volta
+      if (canvas.width !== img.width || canvas.height !== img.height) {
+        canvas.width = img.width;
+        canvas.height = img.height;
+      }
+      setFrameResolution({ w: img.width, h: img.height });
+      ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+    };
+    img.onerror = () => {
+      if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#111";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#fff";
+      ctx.font = "20px sans-serif";
+      ctx.fillText("Frame non disponibile", 20, 40);
+      setFrameResolution(null);
+    };
+    img.src = lastProcessedFrame;
+  }, [lastProcessedFrame]);
+
+  // Helper: cattura un frame dal <video> e lo invia a Kinesis come bytes JPEG
   const captureAndSendFrame = async (video: HTMLVideoElement) => {
-    if (video.readyState < 2) return;
+    if (video.readyState < 2) return; // il video non è ancora pronto
+
+    // — opzionale: ridimensiona per stare sotto 1 MB —
+    const MAX_W = 640;
+    const scale = MAX_W / video.videoWidth;
+    const w = Math.min(MAX_W, video.videoWidth);
+    const h = video.videoHeight * scale;
+
     const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
+    canvas.width = w;
+    canvas.height = h;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.drawImage(video, 0, 0);
-    return new Promise<void>((resolve) => {
-      canvas.toBlob(
-        async (blob) => {
-          if (!blob) return resolve();
-          const arrayBuffer = await blob.arrayBuffer();
-          const base64 = btoa(
-            String.fromCharCode(...new Uint8Array(arrayBuffer))
-          );
-          const payload = {
-            timestamp: new Date().toISOString(),
-            frame_id: `frame_${Date.now()}_${frameCount++}`,
-            frame_data: base64,
-            format: "jpeg",
-            source: "frontend-demo-video",
-          };
-          const result = await sendVideoFrame(JSON.stringify(payload));
-          if (result === true) {
-            addLog("Frame inviato a Kinesis", "info");
-          } else {
-            const errMsg =
-              typeof result === "object" && result && "message" in result
-                ? (result as any).message
-                : String(result);
-            addLog("Errore invio frame: " + errMsg, "error");
-          }
-          resolve();
-        },
-        "image/jpeg",
-        0.8
-      );
-    });
+    ctx.drawImage(video, 0, 0, w, h);
+
+    canvas.toBlob(
+      async (blob) => {
+        if (!blob) return;
+        const arrayBuffer = await blob.arrayBuffer();
+        const frameBytes = new Uint8Array(arrayBuffer); // <-- bytes grezzi
+
+        const res = await sendVideoFrame(frameBytes);
+        if (res !== true) {
+          const errMsg =
+            typeof res === "object" && res && "message" in res
+              ? (res as any).message
+              : String(res);
+          addLog("Errore invio frame: " + errMsg, "error");
+        }
+      },
+      "image/jpeg",
+      0.8 // qualità/compressione JPEG (0-1)
+    );
   };
 
-  // Start streaming: play video, extract frames, send to Kinesis
+  const handleStopStream = () => {
+    setActiveStream(null);
+    setStreamStarted(false);
+    setLogs([]);
+    setWsConnected(false);
+    setLastProcessedFrame(null);
+    setLastDetections(0);
+    setFrameResolution(null);
+    lastFrameIndexRef.current = -1;
+    // Stop polling
+    isPollingActive.current = false;
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    // Stop frame extraction
+    if (frameInterval) clearInterval(frameInterval);
+    if (videoElement) {
+      videoElement.pause();
+      videoElement.remove();
+      videoElement = null;
+    }
+  };
+
   const handleStartStream = async (video: DemoVideo) => {
+    // Pulizia stato prima di partire con nuovo video
+    setLastProcessedFrame(null);
+    setLastDetections(0);
+    setFrameResolution(null);
+    lastFrameIndexRef.current = -1;
+    setLogs([]);
     setLoadingVideoId(video.id);
     setTimeout(() => {
       setActiveStream(video.id);
       setStreamStarted(true);
       setLoadingVideoId(null);
+      // Salva il timestamp di inizio stream
+      streamStartTimeRef.current = Date.now();
       setTimeout(() => {
         // Create hidden video element for frame extraction
         if (!videoElement) {
@@ -274,20 +382,6 @@ export default function VideoProcessingUI() {
         }, 100);
       }, 500);
     }, 1500);
-  };
-
-  const handleStopStream = () => {
-    setActiveStream(null);
-    setStreamStarted(false);
-    setLogs([]);
-    setWsConnected(false);
-    // Stop frame extraction
-    if (frameInterval) clearInterval(frameInterval);
-    if (videoElement) {
-      videoElement.pause();
-      videoElement.remove();
-      videoElement = null;
-    }
   };
 
   return (
@@ -417,13 +511,24 @@ export default function VideoProcessingUI() {
                 {streamStarted && activeVideo ? (
                   <div className="w-full h-full flex flex-col relative">
                     {/* Mostra il frame processato da AWS (s3_url) */}
-                    {lastProcessedFrame ? (
-                      <img
-                        src={lastProcessedFrame}
-                        alt="Processed frame"
-                        className="w-full h-full object-contain bg-black rounded-lg"
-                        style={{ maxHeight: "100%", maxWidth: "100%" }}
-                      />
+                    {streamStarted && lastProcessedFrame ? (
+                      <>
+                        <canvas
+                          ref={canvasRef}
+                          className="w-full h-full object-contain bg-black rounded-lg"
+                          style={{ display: "block" }}
+                        />
+                        {/* ✓ contatore oggetti */}
+                        <div className="absolute bottom-4 left-4 bg-black/70 text-xs text-white px-2 py-1 rounded">
+                          {lastDetections} objects
+                        </div>
+                        {/* Overlay risoluzione frame */}
+                        {frameResolution && (
+                          <div className="absolute bottom-4 right-4 bg-black/70 text-xs text-white px-2 py-1 rounded">
+                            {frameResolution.w}x{frameResolution.h}
+                          </div>
+                        )}
+                      </>
                     ) : (
                       <div className="w-full h-full flex items-center justify-center text-gray-500 bg-black rounded-lg">
                         <span>Nessun frame processato ancora</span>
@@ -433,9 +538,9 @@ export default function VideoProcessingUI() {
                     <div className="absolute top-4 left-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
                       Processing: {activeVideo.filename}
                     </div>
-                    <div className="absolute bottom-4 right-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
+                    {/* <div className="absolute bottom-4 right-4 bg-black/70 rounded px-2 py-1 text-xs text-white">
                       1080p • 30fps
-                    </div>
+                    </div> */}
                     <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
                       <div className="flex flex-col items-center">
                         <Radio className="w-12 h-12 mx-auto mb-4 animate-pulse text-white" />
@@ -474,10 +579,6 @@ export default function VideoProcessingUI() {
                     <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
                     <span className="text-sm font-medium">Stream Active</span>
                   </div>
-                  <p className="text-xs text-green-400 mt-1">
-                    Receiving processed video from:
-                    https://your-backend-url/stream
-                  </p>
                 </div>
               )}
 
