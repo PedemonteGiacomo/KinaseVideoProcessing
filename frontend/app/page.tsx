@@ -234,6 +234,8 @@ export default function VideoProcessingUI() {
 
   useEffect(() => {
     let pollingInterval: NodeJS.Timeout | null = null;
+    // Flag per loggare solo il primo frame ricevuto da SQS per ogni live
+    let firstFrameReceived = false;
 
     async function pollSQS() {
       const results = await receiveLiveVideo();
@@ -256,6 +258,22 @@ export default function VideoProcessingUI() {
           // Reset contatore se riceviamo messaggi
           setConsecutiveEmptyPolls(0);
           setStreamEnded(false);
+
+          // Logga il timestamp del primo frame processato ricevuto da SQS
+          if (!firstFrameReceived) {
+            const now = new Date();
+            const ts =
+              now.toLocaleTimeString("it-IT", { hour12: false }) +
+              "." + String(now.getMilliseconds()).padStart(3, "0");
+            addLog(
+              `⏱️ Primo frame processato ricevuto da SQS alle ${ts}`,
+              "info"
+            );
+            console.log(
+              `[METRIC] Primo frame processato ricevuto da SQS alle ${ts}`
+            );
+            firstFrameReceived = true;
+          }
 
           results.forEach((r) => {
             // 3.1 URL S3
@@ -306,10 +324,15 @@ export default function VideoProcessingUI() {
 
   // Generate a unique id for each log (timestamp + random string)
   const addLog = (message: string, type: "info" | "detection" | "error") => {
-    const uniqueId = `${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    const now = new Date();
+    // Format: HH:mm:ss.SSS
+    const timestamp = now
+      .toLocaleTimeString("it-IT", { hour12: false }) +
+      "." + String(now.getMilliseconds()).padStart(3, "0");
+    const uniqueId = `${now.getTime()}-${Math.random().toString(36).substr(2, 6)}`;
     const newLog = {
       id: uniqueId,
-      timestamp: new Date().toLocaleTimeString(),
+      timestamp,
       message,
       type,
     };
@@ -320,6 +343,8 @@ export default function VideoProcessingUI() {
   let videoElement: HTMLVideoElement | null = null;
   let frameInterval: NodeJS.Timeout | null = null;
   let frameCount = 0;
+  // Flag per loggare il primo frame inviato a Kinesis
+  let firstFrameSent = false;
 
   // Helper: cattura un frame dal <video> e lo invia a Kinesis come bytes JPEG
   const captureAndSendFrame = async (video: HTMLVideoElement) => {
@@ -343,6 +368,16 @@ export default function VideoProcessingUI() {
         if (!blob) return;
         const arrayBuffer = await blob.arrayBuffer();
         const frameBytes = new Uint8Array(arrayBuffer); // <-- bytes grezzi
+
+        if (!firstFrameSent) {
+          const now = new Date();
+          const ts =
+            now.toLocaleTimeString("it-IT", { hour12: false }) +
+            "." + String(now.getMilliseconds()).padStart(3, "0");
+          addLog(`⏱️ Primo frame caricato su Kinesis alle ${ts}`, "info");
+          console.log(`[METRIC] Primo frame caricato su Kinesis alle ${ts}`);
+          firstFrameSent = true;
+        }
 
         const res = await sendVideoFrame(frameBytes);
         if (res !== true) {
@@ -369,6 +404,9 @@ export default function VideoProcessingUI() {
     setLastProcessedFrame(null);
     setLastDetections(0);
     setLogs([]); // Pulisci SEMPRE i log precedenti
+
+    // Reset flag per log primo frame inviato
+    firstFrameSent = false;
 
     // 🧹 CLEANUP: Svuota SEMPRE la coda prima di iniziare nuovo stream
     addLog("🧹 Pulizia coda in corso...", "info");
