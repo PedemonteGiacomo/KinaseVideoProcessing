@@ -76,6 +76,86 @@ async function receiveLiveVideo() {
   }
 }
 
+// Cleanup ottimizzato per SQS FIFO - svuota completamente la coda
+async function cleanupOldMessages() {
+  if (typeof window === "undefined") return 0;
+  const AWS = (await import("aws-sdk")).default;
+  const sqs = new AWS.SQS({
+    region: AWS_REGION as string,
+    accessKeyId: AWS_ACCESS_KEY_ID as string,
+    secretAccessKey: AWS_SECRET_ACCESS_KEY as string,
+  });
+  
+  let cleanedCount = 0;
+  let consecutiveEmptyAttempts = 0;
+  const maxEmptyAttempts = 3; // Ferma dopo 3 tentativi consecutivi senza messaggi
+  const maxTotalAttempts = 30; // Limite massimo per evitare loop infiniti
+  let totalAttempts = 0;
+  
+  console.log("🧹 Inizio cleanup coda SQS FIFO...");
+  
+  while (consecutiveEmptyAttempts < maxEmptyAttempts && totalAttempts < maxTotalAttempts) {
+    try {
+      const params = {
+        QueueUrl: SQS_QUEUE_URL as string,
+        MaxNumberOfMessages: 10, // Massimo per SQS
+        WaitTimeSeconds: 0, // Polling immediato per cleanup veloce
+        VisibilityTimeout: 1, // Timeout breve per cleanup aggressivo
+      };
+      
+      const data = await sqs.receiveMessage(params).promise();
+      
+      if (!data.Messages || data.Messages.length === 0) {
+        consecutiveEmptyAttempts++;
+        totalAttempts++;
+        // Breve pausa prima del prossimo tentativo
+        await new Promise(resolve => setTimeout(resolve, 100));
+        continue;
+      }
+      
+      // Reset counter se troviamo messaggi
+      consecutiveEmptyAttempts = 0;
+      totalAttempts++;
+      
+      // Elimina tutti i messaggi trovati in parallelo
+      const deletePromises = data.Messages.map(message => 
+        sqs.deleteMessage({
+          QueueUrl: SQS_QUEUE_URL as string,
+          ReceiptHandle: message.ReceiptHandle as string,
+        }).promise().catch(err => {
+          // Log dell'errore ma continua con gli altri
+          console.warn("Errore eliminazione singolo messaggio:", err);
+          return null;
+        })
+      );
+      
+      const results = await Promise.allSettled(deletePromises);
+      const successfulDeletes = results.filter(r => r.status === 'fulfilled').length;
+      cleanedCount += successfulDeletes;
+      
+      console.log(`🗑️ Eliminati ${successfulDeletes}/${data.Messages.length} messaggi (totale: ${cleanedCount})`);
+      
+      // Pausa più breve tra i batch per essere più aggressivi
+      await new Promise(resolve => setTimeout(resolve, 25));
+      
+    } catch (error) {
+      console.error("❌ Errore durante cleanup coda:", error);
+      // Su errore, aumenta il counter per evitare loop infiniti
+      consecutiveEmptyAttempts++;
+      totalAttempts++;
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+  }
+  
+  if (cleanedCount > 0) {
+    console.log(`✅ Cleanup completato: ${cleanedCount} messaggi rimossi dalla coda FIFO`);
+  } else {
+    console.log("✅ Coda già vuota");
+  }
+  
+  return cleanedCount;
+}
+
 interface DemoVideo {
   id: string;
   title: string;
@@ -136,6 +216,8 @@ export default function VideoProcessingUI() {
     null
   ); // s3_url
   const [lastDetections, setLastDetections] = useState<number>(0);
+  const [streamEnded, setStreamEnded] = useState(false);
+  const [consecutiveEmptyPolls, setConsecutiveEmptyPolls] = useState(0);
 
   const activeVideo = demoVideos.find((v) => v.id === activeStream);
 
@@ -145,22 +227,39 @@ export default function VideoProcessingUI() {
     async function pollSQS() {
       const results = await receiveLiveVideo();
       if (Array.isArray(results)) {
-        results.forEach((r) => {
-          // 3.1 URL S3
-          const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
-          setLastProcessedFrame(url);
+        if (results.length === 0) {
+          // Nessun messaggio ricevuto - incrementa contatore
+          setConsecutiveEmptyPolls(prev => {
+            const newCount = prev + 1;
+            // Se abbiamo 5 polling consecutivi vuoti (7.5 secondi), consideriamo lo stream terminato
+            if (newCount >= 5) {
+              setStreamEnded(true);
+              addLog("Stream terminato - nessun frame in processamento", "info");
+            }
+            return newCount;
+          });
+        } else {
+          // Reset contatore se riceviamo messaggi
+          setConsecutiveEmptyPolls(0);
+          setStreamEnded(false);
+          
+          results.forEach((r) => {
+            // 3.1 URL S3
+            const url = `https://${r.bucket}.s3.${AWS_REGION}.amazonaws.com/${r.key}`;
+            setLastProcessedFrame(url);
 
-          // 3.2 numero oggetti
-          setLastDetections(r.detections_count);
+            // 3.2 numero oggetti
+            setLastDetections(r.detections_count);
 
-          // 3.3 log sintetico
-          addLog(`Frame #${r.frame_index} → ${r.detections_count} objects`, "info");
+            // 3.3 log sintetico
+            addLog(`Frame #${r.frame_index} → ${r.detections_count} objects`, "info");
 
-          // 3.4 log dettaglio per oggetto
-          r.summary?.forEach((d: any) =>
-            addLog(`${d.class} ${(d.conf * 100).toFixed(0)}%`, "detection")
-          );
-        });
+            // 3.4 log dettaglio per oggetto
+            r.summary?.forEach((d: any) =>
+              addLog(`${d.class} ${(d.conf * 100).toFixed(0)}%`, "detection")
+            );
+          });
+        }
       } else if (results) {
         const errMsg =
           typeof results === "object" && results && "message" in results
@@ -186,7 +285,7 @@ export default function VideoProcessingUI() {
     return () => {
       if (pollingInterval) clearInterval(pollingInterval);
     };
-  }, [streamStarted, activeVideo]);
+  }, [streamStarted, activeVideo, wsConnected]);
 
   const addLog = (message: string, type: "info" | "detection" | "error") => {
     const newLog = {
@@ -243,11 +342,36 @@ export default function VideoProcessingUI() {
 
   // Start streaming: play video, extract frames, send to Kinesis
   const handleStartStream = async (video: DemoVideo) => {
+    // SEMPRE: Mostra loading e resetta stati
     setLoadingVideoId(video.id);
+    setActiveStream(video.id);
+    setStreamStarted(false);
+    setStreamEnded(false);
+    setConsecutiveEmptyPolls(0);
+    setLastProcessedFrame(null);
+    setLastDetections(0);
+    setLogs([]); // Pulisci SEMPRE i log precedenti
+    
+    // 🧹 CLEANUP: Svuota SEMPRE la coda prima di iniziare nuovo stream
+    addLog("🧹 Pulizia coda in corso...", "info");
+    try {
+      const cleanedCount = await cleanupOldMessages();
+      if (cleanedCount && cleanedCount > 0) {
+        addLog(`✅ Rimossi ${cleanedCount} messaggi vecchi dalla coda`, "info");
+      } else {
+        addLog("✅ Coda già vuota, pronto per nuovo stream", "info");
+      }
+    } catch (error) {
+      addLog("❌ Errore durante cleanup coda: " + String(error), "error");
+    }
+    
+    // Ora avvia effettivamente lo stream
+    addLog(`🎬 Avvio stream: ${video.title}`, "info");
+    
     setTimeout(() => {
-      setActiveStream(video.id);
-      setStreamStarted(true);
+      setStreamStarted(true); // Ora è veramente started
       setLoadingVideoId(null);
+      
       setTimeout(() => {
         // Create hidden video element for frame extraction
         if (!videoElement) {
@@ -258,31 +382,51 @@ export default function VideoProcessingUI() {
           videoElement.playsInline = true;
           videoElement.style.display = "none";
           document.body.appendChild(videoElement);
+        } else {
+          // Se esiste già, aggiorna solo il src
+          videoElement.src = `/videos/${video.filename}`;
         }
+        
         videoElement.currentTime = 0;
         videoElement.play();
+        
         // Start frame extraction loop (10 FPS)
         frameInterval = setInterval(() => {
           if (videoElement && !videoElement.paused && !videoElement.ended) {
             captureAndSendFrame(videoElement);
+          } else if (videoElement && videoElement.ended) {
+            // Video terminato, ferma l'invio frame
+            addLog("🎬 Video terminato, stop invio frame", "info");
+            if (frameInterval) clearInterval(frameInterval);
           }
         }, 100);
       }, 500);
-    }, 1500);
+    }, 800); // Riduciamo ulteriormente il timeout
   };
 
   const handleStopStream = () => {
+    addLog("⏹️ Stop stream richiesto dall'utente", "info");
+    
     setActiveStream(null);
     setStreamStarted(false);
-    setLogs([]);
+    setStreamEnded(false);
+    setConsecutiveEmptyPolls(0);
     setWsConnected(false);
+    setLastProcessedFrame(null);
+    setLastDetections(0);
+    
     // Stop frame extraction
-    if (frameInterval) clearInterval(frameInterval);
+    if (frameInterval) {
+      clearInterval(frameInterval);
+      frameInterval = null;
+    }
     if (videoElement) {
       videoElement.pause();
       videoElement.remove();
       videoElement = null;
     }
+    
+    addLog("✅ Stream stoppato completamente", "info");
   };
 
   return (
@@ -468,14 +612,30 @@ export default function VideoProcessingUI() {
               </div>
 
               {streamStarted && (
-                <div className="mt-4 p-3 bg-green-900/20 border border-green-700 rounded-lg">
-                  <div className="flex items-center gap-2 text-green-300">
-                    <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                    <span className="text-sm font-medium">Stream Active</span>
+                <div className={`mt-4 p-3 border rounded-lg ${streamEnded 
+                  ? "bg-orange-900/20 border-orange-700" 
+                  : "bg-green-900/20 border-green-700"
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${streamEnded 
+                      ? "bg-orange-500" 
+                      : "bg-green-500 animate-pulse"
+                    }`}></div>
+                    <span className={`text-sm font-medium ${streamEnded 
+                      ? "text-orange-300" 
+                      : "text-green-300"
+                    }`}>
+                      {streamEnded ? "Stream Terminato" : "Stream Active"}
+                    </span>
                   </div>
-                  <p className="text-xs text-green-400 mt-1">
-                    Receiving processed video from:
-                    https://your-backend-url/stream
+                  <p className={`text-xs mt-1 ${streamEnded 
+                    ? "text-orange-400" 
+                    : "text-green-400"
+                  }`}>
+                    {streamEnded 
+                      ? "Il video è terminato, nessun frame in processamento"
+                      : "Receiving processed video from AWS pipeline"
+                    }
                   </p>
                 </div>
               )}
