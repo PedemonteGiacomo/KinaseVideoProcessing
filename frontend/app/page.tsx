@@ -264,7 +264,8 @@ export default function VideoProcessingUI() {
             const now = new Date();
             const ts =
               now.toLocaleTimeString("it-IT", { hour12: false }) +
-              "." + String(now.getMilliseconds()).padStart(3, "0");
+              "." +
+              String(now.getMilliseconds()).padStart(3, "0");
             addLog(
               `⏱️ Primo frame processato ricevuto da SQS alle ${ts}`,
               "info"
@@ -326,10 +327,13 @@ export default function VideoProcessingUI() {
   const addLog = (message: string, type: "info" | "detection" | "error") => {
     const now = new Date();
     // Format: HH:mm:ss.SSS
-    const timestamp = now
-      .toLocaleTimeString("it-IT", { hour12: false }) +
-      "." + String(now.getMilliseconds()).padStart(3, "0");
-    const uniqueId = `${now.getTime()}-${Math.random().toString(36).substr(2, 6)}`;
+    const timestamp =
+      now.toLocaleTimeString("it-IT", { hour12: false }) +
+      "." +
+      String(now.getMilliseconds()).padStart(3, "0");
+    const uniqueId = `${now.getTime()}-${Math.random()
+      .toString(36)
+      .substr(2, 6)}`;
     const newLog = {
       id: uniqueId,
       timestamp,
@@ -373,7 +377,8 @@ export default function VideoProcessingUI() {
           const now = new Date();
           const ts =
             now.toLocaleTimeString("it-IT", { hour12: false }) +
-            "." + String(now.getMilliseconds()).padStart(3, "0");
+            "." +
+            String(now.getMilliseconds()).padStart(3, "0");
           addLog(`⏱️ Primo frame caricato su Kinesis alle ${ts}`, "info");
           console.log(`[METRIC] Primo frame caricato su Kinesis alle ${ts}`);
           firstFrameSent = true;
